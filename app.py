@@ -28,15 +28,6 @@ def _get_secret(name: str, default: str = "") -> str:
         pass
     return str(os.getenv(name, default)).strip()
 
-# ----------------------------- Azure config (centralized) --------------------
-AZURE_API_KEY         = _get_secret("AZURE_API_KEY")
-AZURE_ENDPOINT_RAW    = _get_secret("AZURE_ENDPOINT")
-AZURE_API_VERSION     = _get_secret("AZURE_API_VERSION") or "2024-06-01"
-
-# Model deployments
-AZURE_CHAT_DEPLOYMENT     = _get_secret("AZURE_DEPLOYMENT") or "gpt-5-chat"
-AZURE_WHISPER_DEPLOYMENT  = _get_secret("WHISPER_DEPLOYMENT") or "whisper-1"
-
 def _normalize_openai_base(url: str) -> str:
     """Ensure endpoint uses *.openai.azure.com (not *.cognitiveservices.azure.com)."""
     if not url:
@@ -46,19 +37,55 @@ def _normalize_openai_base(url: str) -> str:
         url = url.replace(".cognitiveservices.azure.com", ".openai.azure.com")
     return url
 
-AZURE_ENDPOINT = _normalize_openai_base(AZURE_ENDPOINT_RAW)
+# ----------------------------- Azure config (separate) -----------------------
+# ---- Chat (GPT) ----
+CHAT_API_KEY        = _get_secret("AZURE_CHAT_API_KEY") or _get_secret("AZURE_API_KEY")
+CHAT_ENDPOINT_RAW   = _get_secret("AZURE_CHAT_ENDPOINT") or _get_secret("AZURE_ENDPOINT")
+CHAT_API_VERSION    = _get_secret("AZURE_CHAT_API_VERSION") or _get_secret("AZURE_API_VERSION") or "2024-06-01"
+AZURE_CHAT_DEPLOYMENT = _get_secret("AZURE_DEPLOYMENT") or "gpt-5-chat"
 
+CHAT_ENDPOINT = _normalize_openai_base(CHAT_ENDPOINT_RAW)
 AZURE_CHAT_URL = (
-    f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_CHAT_DEPLOYMENT}/chat/completions"
-    f"?api-version={AZURE_API_VERSION}"
+    f"{CHAT_ENDPOINT}/openai/deployments/{AZURE_CHAT_DEPLOYMENT}/chat/completions"
+    f"?api-version={CHAT_API_VERSION}"
 )
-AZURE_WHISPER_URL = (
-    f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_WHISPER_DEPLOYMENT}/audio/transcriptions"
-    f"?api-version={AZURE_API_VERSION}"
-)
+HEADERS_CHAT = {"api-key": CHAT_API_KEY or "", "Content-Type": "application/json"}
 
-# Shared headers for chat calls
-HEADERS = {"api-key": AZURE_API_KEY or "", "Content-Type": "application/json"}
+# ---- Whisper (can be a different resource entirely) ----
+WHISPER_API_KEY        = _get_secret("AZURE_WHISPER_API_KEY") or _get_secret("AZURE_API_KEY")
+WHISPER_ENDPOINT_RAW   = _get_secret("AZURE_WHISPER_ENDPOINT") or _get_secret("AZURE_ENDPOINT")
+WHISPER_API_VERSION    = _get_secret("AZURE_WHISPER_API_VERSION") or _get_secret("AZURE_API_VERSION") or "2024-06-01"
+WHISPER_DEPLOYMENT     = _get_secret("WHISPER_DEPLOYMENT") or "whisper-1"
+WHISPER_TASK           = (_get_secret("AZURE_WHISPER_TASK") or "transcribe").strip()  # "transcribe" | "translate"
+
+# Optional: full URL override exactly like your .env AZURE_WHISPER_URL
+AZURE_WHISPER_URL_OVERRIDE = _get_secret("AZURE_WHISPER_URL")
+
+WHISPER_ENDPOINT = _normalize_openai_base(WHISPER_ENDPOINT_RAW)
+if AZURE_WHISPER_URL_OVERRIDE:
+    AZURE_WHISPER_URL = AZURE_WHISPER_URL_OVERRIDE
+    # Derive the task from the override path, to avoid mismatches.
+    _is_translation_path = "/audio/translations" in AZURE_WHISPER_URL.lower()
+    WHISPER_TASK_FOR_REQUEST = "translate" if _is_translation_path else "transcribe"
+else:
+    _path = "audio/transcriptions" if WHISPER_TASK != "translate" else "audio/translations"
+    AZURE_WHISPER_URL = (
+        f"{WHISPER_ENDPOINT}/openai/deployments/{WHISPER_DEPLOYMENT}/{_path}"
+        f"?api-version={WHISPER_API_VERSION}"
+    )
+    WHISPER_TASK_FOR_REQUEST = WHISPER_TASK
+
+HEADERS_WHISPER = {"api-key": WHISPER_API_KEY or ""}
+
+# Make selected optional knobs available from secrets too (keeps your existing env-based reads)
+for _k in ["OUTPUT_DIR","DATA_DIR","BACKGROUND_IMAGE",
+           "HIGHLIGHT_MIN_LEN","HIGHLIGHT_MAX_LEN","HIGHLIGHT_STEP",
+           "HIGHLIGHT_TOP_N","SCENE_THRESHOLD"]:
+    try:
+        if _k in st.secrets:
+            os.environ[_k] = str(st.secrets[_k])
+    except Exception:
+        pass
 
 # ----------------------------- Utilities -------------------------------------
 def list_dir(path: str) -> List[str]:
@@ -77,6 +104,9 @@ def ensure_dirs(*paths: str):
 
 def _has_binary(name: str) -> bool:
     return shutil.which(name) is not None
+
+def _sh_out(cmd: List[str]) -> str:
+    return subprocess.check_output(cmd, text=True).strip()
 
 # ----------------------------- 1) YouTube Download ---------------------------
 UA = (
@@ -122,12 +152,11 @@ def yt_build_attempts(use_cookies: bool, audio_only: bool) -> List[Tuple[str, Di
     attempts: List[Tuple[str, Dict[str, Any]]] = []
     if use_cookies:
         attempts.append(("Android client + Chrome cookies", {
-            "format": fmt_best, "extractor_args": {"youtube": {"player_client": ["android"]}},
-            "cookiesfrombrowser": ("chrome",),
-        }))
+            "format": fmt_best, "extractor_args": {"youtube": {"player_client": ["android"]}}},
+        ))
     attempts.append(("Android client, no cookies", {
-        "format": fmt_best, "extractor_args": {"youtube": {"player_client": ["android"]}},
-    }))
+        "format": fmt_best, "extractor_args": {"youtube": {"player_client": ["android"]}}},
+    ))
     if use_cookies:
         attempts.append(("Web client + Chrome cookies", {"format": fmt_best, "cookiesfrombrowser": ("chrome",)}))
     attempts.append(("Web client, no cookies", {"format": fmt_best}))
@@ -135,8 +164,8 @@ def yt_build_attempts(use_cookies: bool, audio_only: bool) -> List[Tuple[str, Di
         attempts.append(("Legacy itag 22 MP4 + cookies", {"format": "22/best[ext=mp4]/best", "cookiesfrombrowser": ("chrome",)}))
     if not audio_only:
         attempts.append(("Legacy itag 22 MP4, no cookies", {"format": "22/best[ext=mp4]/best"}))
-    # If audio-only, add explicit audio extract postprocessor
     if audio_only:
+        # Ensure we actually get M4A when audio-only
         for i in range(len(attempts)):
             lbl, opt = attempts[i]
             opt = {**opt, "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "0"}]}
@@ -144,9 +173,6 @@ def yt_build_attempts(use_cookies: bool, audio_only: bool) -> List[Tuple[str, Di
     return attempts
 
 # ----------------------------- 2) Extract Audio ------------------------------
-def _sh_out(cmd: List[str]) -> str:
-    return subprocess.check_output(cmd, text=True).strip()
-
 def _ffprobe_json(path: str) -> dict:
     return json.loads(_sh_out(["ffprobe","-v","error","-print_format","json","-show_format","-show_streams", path]))
 
@@ -288,9 +314,9 @@ def transcribe_audio_streamlit(
     model_lang_choice: str = "auto"   # "en" | "hi" | "auto"
 ) -> Tuple[bool, str, str, Optional[str], Optional[str]]:
 
-    # Validate Azure config
-    if not (AZURE_API_KEY and AZURE_ENDPOINT and AZURE_WHISPER_DEPLOYMENT):
-        return False, "Missing Azure env vars/secrets (AZURE_API_KEY, AZURE_ENDPOINT, WHISPER_DEPLOYMENT).", "", None, None
+    # Validate Whisper config (either full URL override or endpoint+deployment)
+    if not (WHISPER_API_KEY and (AZURE_WHISPER_URL or (WHISPER_ENDPOINT and WHISPER_DEPLOYMENT))):
+        return False, "Missing Whisper config (AZURE_WHISPER_API_KEY and AZURE_WHISPER_URL or ENDPOINT+WHISPER_DEPLOYMENT).", "", None, None
 
     os.makedirs(out_dir, exist_ok=True)
     out_json = os.path.join(out_dir, f"{base_name}.json")
@@ -302,24 +328,23 @@ def transcribe_audio_streamlit(
         media_for_api, _ = _extract_audio_16k_temp(src_media)
         tmp_to_cleanup = Path(media_for_api).parent
 
-    headers = {"api-key": AZURE_API_KEY}
     last_exc = None
     raw = None
 
-    for attempt in range(1, 4):
+    for attempt in range(1, 3+1):
         try:
             with open(media_for_api, "rb") as fh:
                 files = {
                     "file": (Path(media_for_api).name, fh, _guess_mime(Path(media_for_api).name)),
                     "response_format": (None, "verbose_json"),
-                    "task": (None, "transcribe"),
+                    "task": (None, WHISPER_TASK_FOR_REQUEST),
                     "temperature": (None, "0"),
                 }
                 if model_lang_choice in ("en","hi"):
                     files["language"] = (None, model_lang_choice)
-                    if model_lang_choice == "hi":
+                    if model_lang_choice == "hi" and WHISPER_TASK_FOR_REQUEST != "translate":
                         files["prompt"] = (None, HINDI_BIAS_PROMPT)
-                r = requests.post(AZURE_WHISPER_URL, headers=headers, files=files, timeout=900)
+                r = requests.post(AZURE_WHISPER_URL, headers=HEADERS_WHISPER, files=files, timeout=900)
             r.raise_for_status()
             try:
                 raw = r.json()
@@ -400,8 +425,8 @@ SYSTEM_PROMPT = (
 )
 
 def refine_segments_streamlit(inp_path: str, out_path: str, lang: str = "hi", batch_size: int = 10) -> Tuple[bool, str, Optional[str]]:
-    if not (AZURE_API_KEY and AZURE_ENDPOINT and AZURE_CHAT_DEPLOYMENT):
-        return False, "Missing Azure env vars/secrets (AZURE_API_KEY, AZURE_ENDPOINT, AZURE_DEPLOYMENT).", None
+    if not (CHAT_API_KEY and CHAT_ENDPOINT and AZURE_CHAT_DEPLOYMENT):
+        return False, "Missing Chat config (AZURE_CHAT_API_KEY/AZURE_API_KEY, AZURE_CHAT_ENDPOINT/AZURE_ENDPOINT, AZURE_DEPLOYMENT).", None
     try:
         with open(inp_path, "r", encoding="utf-8") as f:
             segs = json.load(f)
@@ -425,7 +450,7 @@ def refine_segments_streamlit(inp_path: str, out_path: str, lang: str = "hi", ba
                 {"role": "user", "content": f"Normalization language hint: {lang}\nINPUT_SEGMENTS:\n{payload}"}
             ]
             body = {"messages": messages, "temperature": 0.0, "max_tokens": 2000}
-            r = requests.post(AZURE_CHAT_URL, headers=HEADERS, json=body, timeout=90)
+            r = requests.post(AZURE_CHAT_URL, headers=HEADERS_CHAT, json=body, timeout=90)
             r.raise_for_status()
             content = r.json()["choices"][0]["message"]["content"]
             parsed = _safe_json_loads(content)
@@ -543,8 +568,7 @@ def clip_candidates(blocks: List[Dict], min_len=MIN_LEN, max_len=MAX_LEN, step=S
         t = base_s
         while t + min_len <= base_e:
             w_end = min(t + max_len, base_e)
-            cands.append((t, w_end, b["text"]))
-            t += step
+            cands.append((t, w_end, b["text"])); t += step
     return cands
 
 def deoverlap_by_score(scored: List[Dict]) -> List[Dict]:
@@ -556,9 +580,9 @@ def deoverlap_by_score(scored: List[Dict]) -> List[Dict]:
     return picked
 
 def azure_scores(texts: List[str], batch_size: int = 12, timeout: int = 60) -> List[float]:
-    if not (AZURE_API_KEY and AZURE_ENDPOINT and AZURE_CHAT_DEPLOYMENT):
+    if not (CHAT_API_KEY and CHAT_ENDPOINT and AZURE_CHAT_DEPLOYMENT):
         return [0.0]*len(texts)
-    headers = {"api-key": AZURE_API_KEY, "Content-Type": "application/json"}
+    headers = HEADERS_CHAT
     scores = [0.0]*len(texts)
     def one_batch(items):
         payload = [{"i": i, "t": (t[:1200] if len(t) > 1200 else t)} for i,t in items]
@@ -838,12 +862,16 @@ st.sidebar.title("⚙️ Controls")
 st.sidebar.info("Outputs folder: `downloads/`")
 
 with st.expander("🔧 Azure config (debug)"):
-    st.write("AZURE_ENDPOINT:", AZURE_ENDPOINT or "(unset)")
-    st.write("AZURE_API_VERSION:", AZURE_API_VERSION)
+    st.write("CHAT endpoint:", CHAT_ENDPOINT or "(unset)")
+    st.write("CHAT API version:", CHAT_API_VERSION)
     st.write("CHAT deployment:", AZURE_CHAT_DEPLOYMENT)
-    st.write("WHISPER deployment:", AZURE_WHISPER_DEPLOYMENT)
     st.write("CHAT URL:", AZURE_CHAT_URL or "(n/a)")
+    st.write("---")
+    st.write("WHISPER endpoint:", WHISPER_ENDPOINT or "(using full URL override)")
+    st.write("WHISPER API version:", WHISPER_API_VERSION)
+    st.write("WHISPER deployment:", WHISPER_DEPLOYMENT)
     st.write("WHISPER URL:", AZURE_WHISPER_URL or "(n/a)")
+    st.write("WHISPER task (request):", WHISPER_TASK_FOR_REQUEST)
 
 with st.expander("🧩 System checks"):
     st.write("ffmpeg found:", _has_binary("ffmpeg"))
@@ -933,8 +961,9 @@ with tabs[1]:
 # --- Tab 3: Transcribe ---
 with tabs[2]:
     st.header("✍️ Transcribe (Azure Whisper)")
-    if not (AZURE_API_KEY and AZURE_ENDPOINT and AZURE_WHISPER_DEPLOYMENT):
-        st.warning("Set AZURE_API_KEY, AZURE_ENDPOINT, and WHISPER_DEPLOYMENT in Streamlit Secrets.")
+    if not (WHISPER_API_KEY and AZURE_WHISPER_URL):
+        st.warning("Set AZURE_WHISPER_API_KEY and either AZURE_WHISPER_URL (full) "
+                   "or AZURE_WHISPER_ENDPOINT + WHISPER_DEPLOYMENT in Streamlit Secrets.")
     src_mode = st.radio("Source", ["Pick from downloads/", "Upload file"], horizontal=True, key="tr_source")
     media_path = None
     if src_mode == "Pick from downloads/":
