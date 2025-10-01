@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 import streamlit as st
 import requests
+from typing import Optional
 
 try:
     from dotenv import load_dotenv
@@ -147,29 +148,45 @@ def yt_try_download(url: str, output_dir: str, opts: Dict[str, Any], label: str)
     except Exception as e:
         return False, f"{label} failed: {e}\n{traceback.format_exc(limit=1)}"
 
-def yt_build_attempts(use_cookies: bool, audio_only: bool) -> List[Tuple[str, Dict[str, Any]]]:
+def yt_build_attempts(cookie_file: Optional[str], audio_only: bool) -> List[Tuple[str, Dict[str, Any]]]:
     fmt_best = "ba[ext=m4a]/bestaudio/best" if audio_only else "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best"
     attempts: List[Tuple[str, Dict[str, Any]]] = []
-    if use_cookies:
-        attempts.append(("Android client + Chrome cookies", {
-            "format": fmt_best, "extractor_args": {"youtube": {"player_client": ["android"]}}},
-        ))
-    attempts.append(("Android client, no cookies", {
-        "format": fmt_best, "extractor_args": {"youtube": {"player_client": ["android"]}}},
-    ))
-    if use_cookies:
-        attempts.append(("Web client + Chrome cookies", {"format": fmt_best, "cookiesfrombrowser": ("chrome",)}))
-    attempts.append(("Web client, no cookies", {"format": fmt_best}))
-    if not audio_only and use_cookies:
-        attempts.append(("Legacy itag 22 MP4 + cookies", {"format": "22/best[ext=mp4]/best", "cookiesfrombrowser": ("chrome",)}))
+
+    def add(lbl, opts, use_android=False):
+        ea = opts.get("extractor_args", {}) or {}
+        yargs = ea.get("youtube", {}) or {}
+        # try Android client first to avoid some 403s
+        if use_android:
+            yargs["player_client"] = ["android"]
+        ea["youtube"] = yargs
+        opts["extractor_args"] = ea
+        attempts.append((lbl, opts))
+
+    common = {"format": fmt_best}
+
+    if cookie_file:
+        add("Android client + cookies.txt", {**common, "cookiefile": cookie_file}, use_android=True)
+    add("Android client, no cookies", {**common}, use_android=True)
+
+    if cookie_file:
+        add("Web client + cookies.txt", {**common, "cookiefile": cookie_file}, use_android=False)
+    add("Web client, no cookies", {**common}, use_android=False)
+
     if not audio_only:
-        attempts.append(("Legacy itag 22 MP4, no cookies", {"format": "22/best[ext=mp4]/best"}))
+        if cookie_file:
+            add("Legacy itag 22 MP4 + cookies.txt", {"format": "22/best[ext=mp4]/best", "cookiefile": cookie_file})
+        add("Legacy itag 22 MP4, no cookies", {"format": "22/best[ext=mp4]/best"})
+
+    # if audio-only, ensure clean M4A
     if audio_only:
-        # Ensure we actually get M4A when audio-only
         for i in range(len(attempts)):
             lbl, opt = attempts[i]
-            opt = {**opt, "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "0"}]}
+            opt = {
+                **opt,
+                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "0"}],
+            }
             attempts[i] = (lbl, opt)
+
     return attempts
 
 # ----------------------------- 2) Extract Audio ------------------------------
@@ -900,27 +917,35 @@ with tabs[0]:
     url = st.text_input("YouTube URL", key="ydl_url")
     col1, col2, col3 = st.columns(3)
     with col1: audio_only = st.checkbox("Audio only (M4A)", key="ydl_audio_only")
-    # On Streamlit Cloud, no Chrome profile → default to False
-    with col2: use_cookies = st.checkbox("Use Chrome cookies", value=False, key="ydl_cookies")
+    with col2: use_cookies = st.checkbox("Use Chrome cookies", value=False, key="ydl_cookies")  # kept for backward compat (ignored)
     with col3: output_dir = st.text_input("Output folder", APP_OUT, key="ydl_out_dir")
+
+    # NEW: cookies.txt uploader
+    cookie_path = None
+    cookie_up = st.file_uploader("Upload cookies.txt (optional)", type=["txt"], key="ydl_cookiefile")
+    if cookie_up:
+        Path("cookies").mkdir(parents=True, exist_ok=True)
+        cookie_path = str(Path("cookies") / "cookies.txt")
+        Path(cookie_path).write_bytes(cookie_up.read())
+        st.caption(f"Using cookies from: `{cookie_path}`")
+
     if st.button("Download", key="ydl_download_btn"):
         if not url.strip():
             st.error("Please enter a valid URL.")
         else:
-            attempts = yt_build_attempts(use_cookies=use_cookies, audio_only=audio_only)
+            attempts = yt_build_attempts(cookie_file=cookie_path, audio_only=audio_only)
             ok = False; errors: List[str] = []
             for label, opts in attempts:
                 ok, msg = yt_try_download(url, output_dir, opts, label)
                 st.write(msg)
                 if ok: break
                 errors.append(msg)
-            if ok: st.success(f"Done! Files saved under `{output_dir}`.")
+            if ok:
+                st.success(f"Done! Files saved under `{output_dir}`.")
             else:
-                st.error("All attempts failed. Try updating yt-dlp or checking network.")
+                st.error("All attempts failed. Upload a fresh cookies.txt and try again.")
                 st.code("\n".join(errors[-3:]), language="text")
-    st.subheader("📂 Files in output")
-    for f in list_dir(output_dir):
-        st.write("•", f)
+
 
 # --- Tab 2: Extract Audio ---
 with tabs[1]:
