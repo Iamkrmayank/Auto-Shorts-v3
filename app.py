@@ -339,6 +339,30 @@ def transcribe_audio_streamlit(
     out_json = os.path.join(out_dir, f"{base_name}.json")
     raw_path = os.path.join(out_dir, f"{base_name}.raw_verbose.json")
 
+    # --- NEW: Force correct task+path based on language choice ---
+    # If user picks Hindi, we ALWAYS want to transcribe (not translate).
+    # Build a request URL that uses /audio/transcriptions in that case,
+    # even if the global override URL points at /audio/translations.
+    def _build_request_url(force_transcribe: bool) -> str:
+        if AZURE_WHISPER_URL:
+            url = AZURE_WHISPER_URL
+            if force_transcribe:
+                # normalize any translations path to transcriptions
+                url = url.replace("/audio/translations", "/audio/transcriptions")
+            return url
+        # no full override: assemble from endpoint+deployment
+        _path = "audio/transcriptions" if force_transcribe else (
+            "audio/translations" if WHISPER_TASK_FOR_REQUEST == "translate" else "audio/transcriptions"
+        )
+        return (
+            f"{WHISPER_ENDPOINT}/openai/deployments/{WHISPER_DEPLOYMENT}/{_path}"
+            f"?api-version={WHISPER_API_VERSION}"
+        )
+
+    # We force transcriptions when Hindi is selected
+    force_transcribe = (model_lang_choice == "hi")
+    request_url = _build_request_url(force_transcribe=force_transcribe)
+
     media_for_api = src_media
     tmp_to_cleanup = None
     if do_extract_audio:
@@ -354,14 +378,17 @@ def transcribe_audio_streamlit(
                 files = {
                     "file": (Path(media_for_api).name, fh, _guess_mime(Path(media_for_api).name)),
                     "response_format": (None, "verbose_json"),
-                    "task": (None, WHISPER_TASK_FOR_REQUEST),
+                    # IMPORTANT: when Hindi selected, we are forcing transcriptions path above,
+                    # and we pass task=transcribe explicitly
+                    "task": (None, "transcribe" if force_transcribe else WHISPER_TASK_FOR_REQUEST),
                     "temperature": (None, "0"),
                 }
                 if model_lang_choice in ("en","hi"):
                     files["language"] = (None, model_lang_choice)
-                    if model_lang_choice == "hi" and WHISPER_TASK_FOR_REQUEST != "translate":
+                    if model_lang_choice == "hi":
                         files["prompt"] = (None, HINDI_BIAS_PROMPT)
-                r = requests.post(AZURE_WHISPER_URL, headers=HEADERS_WHISPER, files=files, timeout=900)
+
+                r = requests.post(request_url, headers=HEADERS_WHISPER, files=files, timeout=900)
             r.raise_for_status()
             try:
                 raw = r.json()
@@ -374,6 +401,7 @@ def transcribe_audio_streamlit(
     else:
         return False, f"Transcription failed after retries: {last_exc}", "", None, None
 
+    # (rest of your function unchanged)
     with open(raw_path, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
 
@@ -398,6 +426,7 @@ def transcribe_audio_streamlit(
             pass
 
     return True, f"Wrote {len(segs)} segments", out_json, srt_path, raw_path
+
 
 # ----------------------------- 4) Refine Transcript (Azure GPT) --------------
 def _safe_json_loads(s: str):
